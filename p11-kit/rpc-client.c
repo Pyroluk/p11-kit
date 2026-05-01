@@ -46,6 +46,7 @@
 #include "rpc.h"
 #include "rpc-message.h"
 #include "virtual.h"
+#include "array.h"
 
 #include <assert.h>
 #include <string.h>
@@ -67,7 +68,423 @@ typedef struct {
 	unsigned int initialized_forkid;
 	bool initialize_done;
 	uint8_t version;
+	p11_array *sessions;
+	uint32_t next_session_handle;
+	uint32_t next_object_handle;
 } rpc_client;
+
+typedef struct {
+	CK_OBJECT_HANDLE local;
+	uint64_t remote;
+} rpc_object_map;
+
+typedef struct {
+	CK_SESSION_HANDLE local;
+	uint64_t remote;
+	CK_SLOT_ID slot_id;
+	p11_array *objects;
+} rpc_session_map;
+
+static void
+rpc_object_map_free (void *data)
+{
+	free (data);
+}
+
+static void
+rpc_session_map_free (void *data)
+{
+	rpc_session_map *session = data;
+
+	if (session != NULL)
+		p11_array_free (session->objects);
+	free (session);
+}
+
+static bool
+rpc_force_handle_translation (void)
+{
+	const char *envvar;
+
+	envvar = secure_getenv ("P11_KIT_RPC_TEST_HANDLE_MAP");
+	return envvar != NULL && envvar[0] != '\0' && strcmp (envvar, "0") != 0;
+}
+
+static bool
+rpc_handle_translation_enabled (void)
+{
+	return sizeof (CK_ULONG) < sizeof (uint64_t) || rpc_force_handle_translation ();
+}
+
+static void
+rpc_handle_mappings_clear (rpc_client *module)
+{
+	if (module->sessions != NULL)
+		p11_array_clear (module->sessions);
+	module->next_session_handle = 0;
+	module->next_object_handle = 0;
+}
+
+static bool
+rpc_alloc_local_handle (uint32_t *counter,
+                        CK_ULONG *handle)
+{
+	while (*counter != UINT32_MAX) {
+		(*counter)++;
+		if (*counter != 0) {
+			*handle = *counter;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static rpc_session_map *
+rpc_lookup_session_local (rpc_client *module,
+                          CK_SESSION_HANDLE local)
+{
+	unsigned int i;
+	rpc_session_map *session;
+
+	if (module->sessions == NULL)
+		return NULL;
+
+	for (i = 0; i < module->sessions->num; i++) {
+		session = module->sessions->elem[i];
+		if (session->local == local)
+			return session;
+	}
+
+	return NULL;
+}
+
+static rpc_object_map *
+rpc_lookup_object_local (rpc_session_map *session,
+                         CK_OBJECT_HANDLE local)
+{
+	unsigned int i;
+	rpc_object_map *object;
+
+	for (i = 0; i < session->objects->num; i++) {
+		object = session->objects->elem[i];
+		if (object->local == local)
+			return object;
+	}
+
+	return NULL;
+}
+
+static rpc_object_map *
+rpc_lookup_object_remote (rpc_session_map *session,
+                          uint64_t remote)
+{
+	unsigned int i;
+	rpc_object_map *object;
+
+	for (i = 0; i < session->objects->num; i++) {
+		object = session->objects->elem[i];
+		if (object->remote == remote)
+			return object;
+	}
+
+	return NULL;
+}
+
+static CK_RV
+rpc_write_mapped_ulong (p11_rpc_message *msg,
+                        uint64_t value)
+{
+	assert (msg != NULL);
+	assert (msg->output != NULL);
+
+	assert (!msg->signature || p11_rpc_message_verify_part (msg, "u"));
+	p11_rpc_buffer_add_uint64 (msg->output, value);
+	return p11_buffer_failed (msg->output) ? CKR_HOST_MEMORY : CKR_OK;
+}
+
+static bool
+rpc_read_mapped_ulong (p11_rpc_message *msg,
+                       uint64_t *value)
+{
+	assert (msg != NULL);
+	assert (msg->input != NULL);
+
+	assert (!msg->signature || p11_rpc_message_verify_part (msg, "u"));
+	return p11_rpc_buffer_get_uint64 (msg->input, &msg->parsed, value);
+}
+
+static CK_RV
+rpc_input_session_handle (rpc_client *module,
+                          p11_rpc_message *msg,
+                          CK_SESSION_HANDLE local)
+{
+	rpc_session_map *session;
+
+	if (!rpc_handle_translation_enabled ())
+		return rpc_write_mapped_ulong (msg, local);
+
+	p11_mutex_lock (&module->mutex);
+	session = rpc_lookup_session_local (module, local);
+	p11_mutex_unlock (&module->mutex);
+
+	if (session == NULL)
+		return CKR_SESSION_HANDLE_INVALID;
+
+	return rpc_write_mapped_ulong (msg, session->remote);
+}
+
+static CK_RV
+rpc_output_session_handle (rpc_client *module,
+                           p11_rpc_message *msg,
+                           CK_SLOT_ID slot_id,
+                           CK_SESSION_HANDLE_PTR session)
+{
+	rpc_session_map *entry;
+	uint64_t remote;
+
+	if (session == NULL)
+		return CKR_ARGUMENTS_BAD;
+	if (!rpc_read_mapped_ulong (msg, &remote))
+		return PARSE_ERROR;
+	if (!rpc_handle_translation_enabled ()) {
+		*session = (CK_SESSION_HANDLE)remote;
+		return CKR_OK;
+	}
+
+	entry = calloc (1, sizeof (*entry));
+	if (entry == NULL)
+		return CKR_HOST_MEMORY;
+
+	entry->objects = p11_array_new (rpc_object_map_free);
+	if (entry->objects == NULL) {
+		free (entry);
+		return CKR_HOST_MEMORY;
+	}
+
+	p11_mutex_lock (&module->mutex);
+	if (!rpc_alloc_local_handle (&module->next_session_handle, &entry->local)) {
+		p11_mutex_unlock (&module->mutex);
+		p11_array_free (entry->objects);
+		free (entry);
+		return CKR_HOST_MEMORY;
+	}
+	entry->remote = remote;
+	entry->slot_id = slot_id;
+	if (module->sessions == NULL)
+		module->sessions = p11_array_new (rpc_session_map_free);
+	if (module->sessions == NULL || !p11_array_push (module->sessions, entry)) {
+		p11_mutex_unlock (&module->mutex);
+		p11_array_free (entry->objects);
+		free (entry);
+		return CKR_HOST_MEMORY;
+	}
+	p11_mutex_unlock (&module->mutex);
+
+	*session = entry->local;
+	return CKR_OK;
+}
+
+static CK_RV
+rpc_input_object_handle (rpc_client *module,
+                         p11_rpc_message *msg,
+                         CK_SESSION_HANDLE session_handle,
+                         CK_OBJECT_HANDLE local)
+{
+	rpc_session_map *session;
+	rpc_object_map *object;
+
+	if (local == CK_INVALID_HANDLE)
+		return rpc_write_mapped_ulong (msg, local);
+
+	if (!rpc_handle_translation_enabled ())
+		return rpc_write_mapped_ulong (msg, local);
+
+	p11_mutex_lock (&module->mutex);
+	session = rpc_lookup_session_local (module, session_handle);
+	object = session ? rpc_lookup_object_local (session, local) : NULL;
+	p11_mutex_unlock (&module->mutex);
+
+	if (session == NULL)
+		return CKR_SESSION_HANDLE_INVALID;
+	if (object == NULL)
+		return CKR_OBJECT_HANDLE_INVALID;
+
+	return rpc_write_mapped_ulong (msg, object->remote);
+}
+
+static CK_RV
+rpc_map_remote_object_handle (rpc_client *module,
+                              CK_SESSION_HANDLE session_handle,
+                              uint64_t remote,
+                              CK_OBJECT_HANDLE_PTR object_handle)
+{
+	rpc_session_map *session;
+	rpc_object_map *object;
+
+	if (object_handle == NULL)
+		return CKR_ARGUMENTS_BAD;
+	if (remote == CK_INVALID_HANDLE) {
+		*object_handle = (CK_OBJECT_HANDLE)remote;
+		return CKR_OK;
+	}
+	if (!rpc_handle_translation_enabled ()) {
+		*object_handle = (CK_OBJECT_HANDLE)remote;
+		return CKR_OK;
+	}
+
+	p11_mutex_lock (&module->mutex);
+	session = rpc_lookup_session_local (module, session_handle);
+	if (session == NULL) {
+		p11_mutex_unlock (&module->mutex);
+		return CKR_SESSION_HANDLE_INVALID;
+	}
+
+	object = rpc_lookup_object_remote (session, remote);
+	if (object == NULL) {
+		object = calloc (1, sizeof (*object));
+		if (object == NULL) {
+			p11_mutex_unlock (&module->mutex);
+			return CKR_HOST_MEMORY;
+		}
+
+		if (!rpc_alloc_local_handle (&module->next_object_handle, &object->local) ||
+		    !p11_array_push (session->objects, object)) {
+			p11_mutex_unlock (&module->mutex);
+			free (object);
+			return CKR_HOST_MEMORY;
+		}
+
+		object->remote = remote;
+	}
+
+	*object_handle = object->local;
+	p11_mutex_unlock (&module->mutex);
+	return CKR_OK;
+}
+
+static CK_RV
+rpc_output_object_handle (rpc_client *module,
+                          p11_rpc_message *msg,
+                          CK_SESSION_HANDLE session_handle,
+                          CK_OBJECT_HANDLE_PTR object_handle)
+{
+	uint64_t remote;
+
+	if (!rpc_read_mapped_ulong (msg, &remote))
+		return PARSE_ERROR;
+
+	return rpc_map_remote_object_handle (module, session_handle, remote, object_handle);
+}
+
+static CK_RV
+rpc_output_object_array (rpc_client *module,
+                         p11_rpc_message *msg,
+                         CK_SESSION_HANDLE session_handle,
+                         CK_OBJECT_HANDLE_PTR objects,
+                         CK_ULONG_PTR count)
+{
+	CK_ULONG max;
+	uint32_t i, num;
+	uint64_t remote;
+	unsigned char valid;
+	CK_RV ret;
+
+	if (count == NULL)
+		return CKR_ARGUMENTS_BAD;
+
+	max = *count;
+
+	assert (!msg->signature || p11_rpc_message_verify_part (msg, "au"));
+
+	if (!p11_rpc_buffer_get_byte (msg->input, &msg->parsed, &valid) ||
+	    !p11_rpc_buffer_get_uint32 (msg->input, &msg->parsed, &num))
+		return PARSE_ERROR;
+
+	*count = num;
+
+	if (!valid)
+		return objects ? CKR_BUFFER_TOO_SMALL : CKR_OK;
+	if (max < num)
+		return CKR_BUFFER_TOO_SMALL;
+
+	for (i = 0; i < num; i++) {
+		if (!p11_rpc_buffer_get_uint64 (msg->input, &msg->parsed, &remote))
+			return PARSE_ERROR;
+		if (objects != NULL) {
+			ret = rpc_map_remote_object_handle (module, session_handle, remote, &objects[i]);
+			if (ret != CKR_OK)
+				return ret;
+		}
+	}
+
+	return p11_buffer_failed (msg->input) ? PARSE_ERROR : CKR_OK;
+}
+
+static void
+rpc_invalidate_object_handle (rpc_client *module,
+                              CK_SESSION_HANDLE session_handle,
+                              CK_OBJECT_HANDLE local)
+{
+	rpc_session_map *session;
+	unsigned int i;
+
+	if (!rpc_handle_translation_enabled ())
+		return;
+
+	p11_mutex_lock (&module->mutex);
+	session = rpc_lookup_session_local (module, session_handle);
+	if (session != NULL) {
+		for (i = 0; i < session->objects->num; i++) {
+			rpc_object_map *object = session->objects->elem[i];
+			if (object->local == local) {
+				p11_array_remove (session->objects, i);
+				break;
+			}
+		}
+	}
+	p11_mutex_unlock (&module->mutex);
+}
+
+static void
+rpc_invalidate_session_handle (rpc_client *module,
+                               CK_SESSION_HANDLE local)
+{
+	unsigned int i;
+
+	if (!rpc_handle_translation_enabled () || module->sessions == NULL)
+		return;
+
+	p11_mutex_lock (&module->mutex);
+	for (i = 0; i < module->sessions->num; i++) {
+		rpc_session_map *session = module->sessions->elem[i];
+		if (session->local == local) {
+			p11_array_remove (module->sessions, i);
+			break;
+		}
+	}
+	p11_mutex_unlock (&module->mutex);
+}
+
+static void
+rpc_invalidate_sessions_for_slot (rpc_client *module,
+                                  CK_SLOT_ID slot_id)
+{
+	unsigned int i;
+
+	if (!rpc_handle_translation_enabled () || module->sessions == NULL)
+		return;
+
+	p11_mutex_lock (&module->mutex);
+	for (i = 0; i < module->sessions->num; ) {
+		rpc_session_map *session = module->sessions->elem[i];
+		if (session->slot_id == slot_id)
+			p11_array_remove (module->sessions, i);
+		else
+			i++;
+	}
+	p11_mutex_unlock (&module->mutex);
+}
 
 /* Allocator for call session buffers */
 static void *
@@ -857,7 +1274,7 @@ rpc_C_Initialize (CK_X_FUNCTION_LIST *self,
 			if (ret == CKR_OK) {
 				module->version = 0;
 				ret = (module->vtable->authenticate) (module->vtable,
-								      &module->version);
+							      &module->version);
 			}
 		}
 #endif
@@ -865,6 +1282,7 @@ rpc_C_Initialize (CK_X_FUNCTION_LIST *self,
 
 	/* Successfully initialized */
 	if (ret == CKR_OK) {
+		rpc_handle_mappings_clear (module);
 		module->initialized_forkid = p11_forkid;
 		module->initialize_done = true;
 		p11_debug ("authenticated with protocol version %u",
@@ -946,6 +1364,7 @@ rpc_C_Finalize (CK_X_FUNCTION_LIST *self,
 		(module->vtable->disconnect) (module->vtable, reserved);
 	}
 
+	rpc_handle_mappings_clear (module);
 	module->initialized_forkid = 0;
 
 	p11_mutex_unlock (&module->mutex);
@@ -958,24 +1377,23 @@ static CK_RV
 fill_stand_in_info (CK_INFO_PTR info)
 {
 	static CK_INFO stand_in_info = {
-		{ CRYPTOKI_VERSION_MAJOR, CRYPTOKI_VERSION_MINOR },
-		"p11-kit                         ",
+		{ CRYPTOKI_LEGACY_VERSION_MAJOR, CRYPTOKI_LEGACY_VERSION_MINOR },
+		"PKCS#11 Kit Client                ",
 		0,
-		"p11-kit (no connection)         ",
-		{ 1, 1 },
+		"PKCS#11 Kit Client Module         ",
+		{ 1, 1 }
 	};
+
+	assert (info != NULL);
 	memcpy (info, &stand_in_info, sizeof (CK_INFO));
 	return CKR_OK;
-
 }
 
 static CK_RV
 rpc_C_GetInfo (CK_X_FUNCTION_LIST *self,
                CK_INFO_PTR info)
 {
-	return_val_if_fail (info, CKR_ARGUMENTS_BAD);
-
-	BEGIN_CALL_OR (C_GetInfo, self, fill_stand_in_info (info));
+	BEGIN_CALL_OR (C_GetInfo, self, CKR_DEVICE_REMOVED);
 	PROCESS_CALL;
 		OUT_INFO (info);
 	END_CALL;
@@ -987,9 +1405,7 @@ rpc_C_GetSlotList (CK_X_FUNCTION_LIST *self,
                    CK_SLOT_ID_PTR slot_list,
                    CK_ULONG_PTR count)
 {
-	return_val_if_fail (count, CKR_ARGUMENTS_BAD);
-
-	BEGIN_CALL_OR (C_GetSlotList, self, (*count = 0, CKR_OK));
+	BEGIN_CALL_OR (C_GetSlotList, self, CKR_DEVICE_REMOVED);
 		IN_BYTE (token_present);
 		IN_ULONG_BUFFER (slot_list, count);
 	PROCESS_CALL;
@@ -1002,8 +1418,6 @@ rpc_C_GetSlotInfo (CK_X_FUNCTION_LIST *self,
                    CK_SLOT_ID slot_id,
                    CK_SLOT_INFO_PTR info)
 {
-	return_val_if_fail (info, CKR_ARGUMENTS_BAD);
-
 	BEGIN_CALL_OR (C_GetSlotInfo, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 	PROCESS_CALL;
@@ -1016,8 +1430,6 @@ rpc_C_GetTokenInfo (CK_X_FUNCTION_LIST *self,
                     CK_SLOT_ID slot_id,
                     CK_TOKEN_INFO_PTR info)
 {
-	return_val_if_fail (info, CKR_ARGUMENTS_BAD);
-
 	BEGIN_CALL_OR (C_GetTokenInfo, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 	PROCESS_CALL;
@@ -1031,8 +1443,6 @@ rpc_C_GetMechanismList (CK_X_FUNCTION_LIST *self,
                         CK_MECHANISM_TYPE_PTR mechanism_list,
                         CK_ULONG_PTR count)
 {
-	return_val_if_fail (count, CKR_ARGUMENTS_BAD);
-
 	BEGIN_CALL_OR (C_GetMechanismList, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 		IN_ULONG_BUFFER (mechanism_list, count);
@@ -1047,8 +1457,6 @@ rpc_C_GetMechanismInfo (CK_X_FUNCTION_LIST *self,
                         CK_MECHANISM_TYPE type,
                         CK_MECHANISM_INFO_PTR info)
 {
-	return_val_if_fail (info, CKR_ARGUMENTS_BAD);
-
 	BEGIN_CALL_OR (C_GetMechanismInfo, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 		IN_MECHANISM_TYPE (type);
@@ -1057,16 +1465,33 @@ rpc_C_GetMechanismInfo (CK_X_FUNCTION_LIST *self,
 	END_CALL;
 }
 
+/* -----------------------------------------------------------------------------
+ * PKCS#11 V1.0 and V2.0 compatible functions.
+ */
+
 static CK_RV
 C_InitToken1 (CK_X_FUNCTION_LIST *self,
               CK_SLOT_ID slot_id,
               CK_UTF8CHAR_PTR pin, CK_ULONG pin_len,
               CK_UTF8CHAR_PTR label)
 {
-	BEGIN_CALL_OR (C_InitToken, self, CKR_SLOT_ID_INVALID);
+	char fixed_label[32];
+	char *reserved = "";
+
+	return_val_if_fail (pin, CKR_ARGUMENTS_BAD);
+	return_val_if_fail (label, CKR_ARGUMENTS_BAD);
+
+	/* Caller should be checking this */
+	assert (strlen ((char *)label) < 32);
+
+	memset (fixed_label, ' ', sizeof (fixed_label));
+	memcpy (fixed_label, label, strlen ((char *)label));
+
+	BEGIN_CALL_OR (C_InitToken1, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 		IN_BYTE_ARRAY (pin, pin_len);
-		IN_ZERO_STRING (label);
+		IN_SPACE_STRING (fixed_label, sizeof (fixed_label));
+		IN_ZERO_STRING (reserved);
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1077,6 +1502,9 @@ C_InitToken2 (CK_X_FUNCTION_LIST *self,
               CK_UTF8CHAR_PTR pin, CK_ULONG pin_len,
               CK_UTF8CHAR_PTR label)
 {
+	return_val_if_fail (pin, CKR_ARGUMENTS_BAD);
+	return_val_if_fail (label, CKR_ARGUMENTS_BAD);
+
 	BEGIN_CALL_OR (C_InitToken2, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 		IN_BYTE_ARRAY (pin, pin_len);
@@ -1128,7 +1556,7 @@ rpc_C_OpenSession (CK_X_FUNCTION_LIST *self,
 		IN_ULONG (slot_id);
 		IN_ULONG (flags);
 	PROCESS_CALL;
-		OUT_ULONG (session);
+		_ret = rpc_output_session_handle (_mod, &_msg, slot_id, session);
 	END_CALL;
 }
 
@@ -1137,8 +1565,11 @@ rpc_C_CloseSession (CK_X_FUNCTION_LIST *self,
                     CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_CloseSession, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
+		if (_ret == CKR_OK)
+			rpc_invalidate_session_handle (_mod, session);
 	END_CALL;
 }
 
@@ -1149,6 +1580,8 @@ rpc_C_CloseAllSessions (CK_X_FUNCTION_LIST *self,
 	BEGIN_CALL_OR (C_CloseAllSessions, self, CKR_SLOT_ID_INVALID);
 		IN_ULONG (slot_id);
 	PROCESS_CALL;
+		if (_ret == CKR_OK)
+			rpc_invalidate_sessions_for_slot (_mod, slot_id);
 	END_CALL;
 }
 
@@ -1160,7 +1593,8 @@ rpc_C_GetSessionInfo (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (info, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_GetSessionInfo, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 		OUT_SESSION_INFO (info);
 	END_CALL;
@@ -1173,7 +1607,8 @@ rpc_C_InitPIN (CK_X_FUNCTION_LIST *self,
                CK_ULONG pin_len)
 {
 	BEGIN_CALL_OR (C_InitPIN, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (pin, pin_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -1188,7 +1623,8 @@ rpc_C_SetPIN (CK_X_FUNCTION_LIST *self,
               CK_ULONG new_pin_len)
 {
 	BEGIN_CALL_OR (C_SetPIN, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (old_pin, old_pin_len);
 		IN_BYTE_ARRAY (new_pin, new_pin_len);
 	PROCESS_CALL;
@@ -1204,7 +1640,8 @@ rpc_C_GetOperationState (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (operation_state_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_GetOperationState, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (operation_state, operation_state_len);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (operation_state, operation_state_len);
@@ -1220,10 +1657,13 @@ rpc_C_SetOperationState (CK_X_FUNCTION_LIST *self,
                          CK_OBJECT_HANDLE authentication_key)
 {
 	BEGIN_CALL_OR (C_SetOperationState, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (operation_state, operation_state_len);
-		IN_ULONG (encryption_key);
-		IN_ULONG (authentication_key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, encryption_key);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, authentication_key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1236,7 +1676,8 @@ rpc_C_Login (CK_X_FUNCTION_LIST *self,
              CK_ULONG pin_len)
 {
 	BEGIN_CALL_OR (C_Login, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ULONG (user_type);
 		IN_BYTE_ARRAY (pin, pin_len);
 	PROCESS_CALL;
@@ -1248,7 +1689,8 @@ rpc_C_Logout (CK_X_FUNCTION_LIST *self,
               CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_Logout, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1263,10 +1705,11 @@ rpc_C_CreateObject (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (new_object, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_CreateObject, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
-		OUT_ULONG (new_object);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, new_object);
 	END_CALL;
 }
 
@@ -1281,11 +1724,13 @@ rpc_C_CopyObject (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (new_object, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_CopyObject, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
-		IN_ULONG (object);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, object);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
-		OUT_ULONG (new_object);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, new_object);
 	END_CALL;
 }
 
@@ -1296,9 +1741,13 @@ rpc_C_DestroyObject (CK_X_FUNCTION_LIST *self,
                      CK_OBJECT_HANDLE object)
 {
 	BEGIN_CALL_OR (C_DestroyObject, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
-		IN_ULONG (object);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, object);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
+		if (_ret == CKR_OK)
+			rpc_invalidate_object_handle (_mod, session, object);
 	END_CALL;
 }
 
@@ -1311,8 +1760,10 @@ rpc_C_GetObjectSize (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (size, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_GetObjectSize, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
-		IN_ULONG (object);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, object);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 		OUT_ULONG (size);
 	END_CALL;
@@ -1326,8 +1777,10 @@ rpc_C_GetAttributeValue (CK_X_FUNCTION_LIST *self,
                          CK_ULONG count)
 {
 	BEGIN_CALL_OR (C_GetAttributeValue, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
-		IN_ULONG (object);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, object);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_BUFFER (template, count);
 	PROCESS_CALL;
 		OUT_ATTRIBUTE_ARRAY (template, count);
@@ -1342,8 +1795,10 @@ rpc_C_SetAttributeValue (CK_X_FUNCTION_LIST *self,
                          CK_ULONG count)
 {
 	BEGIN_CALL_OR (C_SetAttributeValue, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
-		IN_ULONG (object);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, object);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
 	END_CALL;
@@ -1356,7 +1811,8 @@ rpc_C_FindObjectsInit (CK_X_FUNCTION_LIST *self,
                        CK_ULONG count)
 {
 	BEGIN_CALL_OR (C_FindObjectsInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
 	END_CALL;
@@ -1375,11 +1831,12 @@ rpc_C_FindObjects (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (count, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_FindObjects, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ULONG_BUFFER (objects, address_of_max_count);
 	PROCESS_CALL;
 		*count = max_count;
-		OUT_ULONG_ARRAY (objects, count);
+		_ret = rpc_output_object_array (_mod, &_msg, session, objects, count);
 	END_CALL;
 }
 
@@ -1388,7 +1845,8 @@ rpc_C_FindObjectsFinal (CK_X_FUNCTION_LIST *self,
                         CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_FindObjectsFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1400,9 +1858,11 @@ rpc_C_EncryptInit (CK_X_FUNCTION_LIST *self,
                    CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_EncryptInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1418,7 +1878,8 @@ rpc_C_Encrypt (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (encrypted_data_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_Encrypt, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (data, data_len);
 		IN_BYTE_BUFFER (encrypted_data, encrypted_data_len);
 	PROCESS_CALL;
@@ -1437,7 +1898,8 @@ rpc_C_EncryptUpdate (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (encrypted_part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_EncryptUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (part, part_len);
 		IN_BYTE_BUFFER (encrypted_part, encrypted_part_len);
 	PROCESS_CALL;
@@ -1454,7 +1916,8 @@ rpc_C_EncryptFinal (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (last_part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_EncryptFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (last_part, last_part_len);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (last_part, last_part_len);
@@ -1468,9 +1931,11 @@ rpc_C_DecryptInit (CK_X_FUNCTION_LIST *self,
                    CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_DecryptInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1486,7 +1951,8 @@ rpc_C_Decrypt (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (data_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_Decrypt, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (enc_data, enc_data_len);
 		IN_BYTE_BUFFER (data, data_len);
 	PROCESS_CALL;
@@ -1505,7 +1971,8 @@ rpc_C_DecryptUpdate (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DecryptUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (enc_part, enc_part_len);
 		IN_BYTE_BUFFER (part, part_len);
 	PROCESS_CALL;
@@ -1522,7 +1989,8 @@ rpc_C_DecryptFinal (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (last_part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DecryptFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (last_part, last_part_len);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (last_part, last_part_len);
@@ -1535,7 +2003,8 @@ rpc_C_DigestInit (CK_X_FUNCTION_LIST *self,
                   CK_MECHANISM_PTR mechanism)
 {
 	BEGIN_CALL_OR (C_DigestInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
 	PROCESS_CALL;
 	END_CALL;
@@ -1552,7 +2021,8 @@ rpc_C_Digest (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (digest_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_Digest, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (data, data_len);
 		IN_BYTE_BUFFER (digest, digest_len);
 	PROCESS_CALL;
@@ -1567,7 +2037,8 @@ rpc_C_DigestUpdate (CK_X_FUNCTION_LIST *self,
                     CK_ULONG part_len)
 {
 	BEGIN_CALL_OR (C_DigestUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (part, part_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -1579,8 +2050,10 @@ rpc_C_DigestKey (CK_X_FUNCTION_LIST *self,
                  CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_DigestKey, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
-		IN_ULONG (key);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1594,7 +2067,8 @@ rpc_C_DigestFinal (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (digest_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DigestFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (digest, digest_len);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (digest, digest_len);
@@ -1608,9 +2082,11 @@ rpc_C_SignInit (CK_X_FUNCTION_LIST *self,
                 CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_SignInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1626,7 +2102,8 @@ rpc_C_Sign (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (signature_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_Sign, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (data, data_len);
 		IN_BYTE_BUFFER (signature, signature_len);
 	PROCESS_CALL;
@@ -1641,7 +2118,8 @@ rpc_C_SignUpdate (CK_X_FUNCTION_LIST *self,
                   CK_ULONG part_len)
 {
 	BEGIN_CALL_OR (C_SignUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (part, part_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -1656,7 +2134,8 @@ rpc_C_SignFinal (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (signature_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_SignFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (signature, signature_len);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (signature, signature_len);
@@ -1670,9 +2149,11 @@ rpc_C_SignRecoverInit (CK_X_FUNCTION_LIST *self,
                        CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_SignRecoverInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1687,7 +2168,8 @@ rpc_C_SignRecover (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (signature_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_SignRecover, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (data, data_len);
 		IN_BYTE_BUFFER (signature, signature_len);
 	PROCESS_CALL;
@@ -1702,9 +2184,11 @@ rpc_C_VerifyInit (CK_X_FUNCTION_LIST *self,
                   CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_VerifyInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1718,7 +2202,8 @@ rpc_C_Verify (CK_X_FUNCTION_LIST *self,
               CK_ULONG signature_len)
 {
 	BEGIN_CALL_OR (C_Verify, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (data, data_len);
 		IN_BYTE_ARRAY (signature, signature_len);
 	PROCESS_CALL;
@@ -1732,7 +2217,8 @@ rpc_C_VerifyUpdate (CK_X_FUNCTION_LIST *self,
                     CK_ULONG part_len)
 {
 	BEGIN_CALL_OR (C_VerifyUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (part, part_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -1745,7 +2231,8 @@ rpc_C_VerifyFinal (CK_X_FUNCTION_LIST *self,
                    CK_ULONG signature_len)
 {
 	BEGIN_CALL_OR (C_VerifyFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (signature, signature_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -1758,9 +2245,11 @@ rpc_C_VerifyRecoverInit (CK_X_FUNCTION_LIST *self,
                          CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_VerifyRecoverInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -1776,7 +2265,8 @@ rpc_C_VerifyRecover (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (data_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_VerifyRecover, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (signature, signature_len);
 		IN_BYTE_BUFFER (data, data_len);
 	PROCESS_CALL;
@@ -1795,7 +2285,8 @@ rpc_C_DigestEncryptUpdate (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (enc_part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DigestEncryptUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (part, part_len);
 		IN_BYTE_BUFFER (enc_part, enc_part_len);
 	PROCESS_CALL;
@@ -1814,7 +2305,8 @@ rpc_C_DecryptDigestUpdate (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DecryptDigestUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (enc_part, enc_part_len);
 		IN_BYTE_BUFFER (part, part_len);
 	PROCESS_CALL;
@@ -1833,7 +2325,8 @@ rpc_C_SignEncryptUpdate (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (enc_part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_SignEncryptUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (part, part_len);
 		IN_BYTE_BUFFER (enc_part, enc_part_len);
 	PROCESS_CALL;
@@ -1852,7 +2345,8 @@ rpc_C_DecryptVerifyUpdate (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (part_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DecryptVerifyUpdate, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (enc_part, enc_part_len);
 		IN_BYTE_BUFFER (part, part_len);
 	PROCESS_CALL;
@@ -1869,11 +2363,12 @@ rpc_C_GenerateKey (CK_X_FUNCTION_LIST *self,
                    CK_OBJECT_HANDLE_PTR key)
 {
 	BEGIN_CALL_OR (C_GenerateKey, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
-		OUT_ULONG (key);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, key);
 	END_CALL;
 }
 
@@ -1889,13 +2384,15 @@ rpc_C_GenerateKeyPair (CK_X_FUNCTION_LIST *self,
                        CK_OBJECT_HANDLE_PTR priv_key)
 {
 	BEGIN_CALL_OR (C_GenerateKeyPair, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
 		IN_ATTRIBUTE_ARRAY (pub_template, pub_count);
 		IN_ATTRIBUTE_ARRAY (priv_template, priv_count);
 	PROCESS_CALL;
-		OUT_ULONG (pub_key);
-		OUT_ULONG (priv_key);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, pub_key);
+		if (_ret == CKR_OK)
+			_ret = rpc_output_object_handle (_mod, &_msg, session, priv_key);
 	END_CALL;
 }
 
@@ -1911,10 +2408,13 @@ rpc_C_WrapKey (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (wrapped_key_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_WrapKey, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (wrapping_key);
-		IN_ULONG (key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, wrapping_key);
+		if (_ret != CKR_OK) goto _cleanup;
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (wrapped_key, wrapped_key_len);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (wrapped_key, wrapped_key_len);
@@ -1933,13 +2433,15 @@ rpc_C_UnwrapKey (CK_X_FUNCTION_LIST *self,
                  CK_OBJECT_HANDLE_PTR key)
 {
 	BEGIN_CALL_OR (C_UnwrapKey, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (unwrapping_key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, unwrapping_key);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (wrapped_key, wrapped_key_len);
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
-		OUT_ULONG (key);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, key);
 	END_CALL;
 }
 
@@ -1953,12 +2455,14 @@ C_DeriveKey1 (CK_X_FUNCTION_LIST *self,
               CK_OBJECT_HANDLE_PTR key)
 {
 	BEGIN_CALL_OR (C_DeriveKey, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (base_key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, base_key);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL;
-		OUT_ULONG (key);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, key);
 	END_CALL;
 }
 
@@ -1973,15 +2477,17 @@ C_DeriveKey2 (CK_X_FUNCTION_LIST *self,
 {
 	PREP_EEOF;
 	BEGIN_CALL_OR (C_DeriveKey2, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism);
-		IN_ULONG (base_key);
+		_ret = rpc_input_object_handle (_mod, &_msg, session, base_key);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ATTRIBUTE_ARRAY (template, count);
 	PROCESS_CALL_NO_CHECK;
 		OUT_ERROR (err);
 		OUT_MECH_PARAM_UPDATE (mechanism);
 		CHECK_EEOF;
-		OUT_ULONG (key);
+		_ret = rpc_output_object_handle (_mod, &_msg, session, key);
 	END_CALL;
 }
 
@@ -2009,7 +2515,8 @@ rpc_C_SeedRandom (CK_X_FUNCTION_LIST *self,
                   CK_ULONG seed_len)
 {
 	BEGIN_CALL_OR (C_SeedRandom, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (seed, seed_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -2024,7 +2531,8 @@ rpc_C_GenerateRandom (CK_X_FUNCTION_LIST *self,
 	CK_ULONG_PTR address = &random_len;
 
 	BEGIN_CALL_OR (C_GenerateRandom, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session);
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_BUFFER (random_data, address);
 	PROCESS_CALL;
 		OUT_BYTE_ARRAY (random_data, address);
@@ -2041,7 +2549,8 @@ rpc_C_LoginUser (CK_X_FUNCTION_LIST *self,
                  CK_ULONG username_len)
 {
 	BEGIN_CALL_OR (C_LoginUser, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ULONG (user_type)
 		IN_BYTE_ARRAY (pin, pin_len)
 		IN_BYTE_ARRAY (username, username_len)
@@ -2055,7 +2564,8 @@ rpc_C_SessionCancel (CK_X_FUNCTION_LIST *self,
                      CK_FLAGS flags)
 {
 	BEGIN_CALL_OR (C_SessionCancel, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_ULONG (flags)
 	PROCESS_CALL;
 	END_CALL;
@@ -2068,9 +2578,11 @@ rpc_C_MessageEncryptInit (CK_X_FUNCTION_LIST *self,
                           CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_MessageEncryptInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism)
-		IN_ULONG (key)
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2090,7 +2602,8 @@ rpc_C_EncryptMessage (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (ciphertext_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_EncryptMessage, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (associated_data, associated_data_len)
 		IN_BYTE_ARRAY (plaintext, plaintext_len)
@@ -2109,7 +2622,8 @@ rpc_C_EncryptMessageBegin (CK_X_FUNCTION_LIST *self,
                            CK_ULONG associated_data_len)
 {
 	BEGIN_CALL_OR (C_EncryptMessageBegin, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (associated_data, associated_data_len)
 	PROCESS_CALL;
@@ -2128,7 +2642,8 @@ rpc_C_EncryptMessageNext (CK_X_FUNCTION_LIST *self,
                           CK_FLAGS flags)
 {
 	BEGIN_CALL_OR (C_EncryptMessageNext, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (plaintext_part, plaintext_part_len)
 		IN_BYTE_BUFFER (ciphertext_part, ciphertext_part_len);
@@ -2143,7 +2658,8 @@ rpc_C_MessageEncryptFinal (CK_X_FUNCTION_LIST *self,
                            CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_MessageEncryptFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2155,9 +2671,11 @@ rpc_C_MessageDecryptInit (CK_X_FUNCTION_LIST *self,
                           CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_MessageDecryptInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism)
-		IN_ULONG (key)
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2177,7 +2695,8 @@ rpc_C_DecryptMessage (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (plaintext_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_DecryptMessage, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (associated_data, associated_data_len)
 		IN_BYTE_ARRAY (ciphertext, ciphertext_len)
@@ -2196,7 +2715,8 @@ rpc_C_DecryptMessageBegin (CK_X_FUNCTION_LIST *self,
                            CK_ULONG associated_data_len)
 {
 	BEGIN_CALL_OR (C_DecryptMessageBegin, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (associated_data, associated_data_len)
 	PROCESS_CALL;
@@ -2215,7 +2735,8 @@ rpc_C_DecryptMessageNext (CK_X_FUNCTION_LIST *self,
                           CK_FLAGS flags)
 {
 	BEGIN_CALL_OR (C_DecryptMessageNext, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (ciphertext_part, ciphertext_part_len)
 		IN_BYTE_BUFFER (plaintext_part, plaintext_part_len);
@@ -2230,7 +2751,8 @@ rpc_C_MessageDecryptFinal (CK_X_FUNCTION_LIST *self,
                            CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_MessageDecryptFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2242,9 +2764,11 @@ rpc_C_MessageSignInit (CK_X_FUNCTION_LIST *self,
                        CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_MessageSignInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism)
-		IN_ULONG (key)
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2262,7 +2786,8 @@ rpc_C_SignMessage (CK_X_FUNCTION_LIST *self,
 	return_val_if_fail (signature_len, CKR_ARGUMENTS_BAD);
 
 	BEGIN_CALL_OR (C_SignMessage, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (data, data_len)
 		IN_BYTE_BUFFER (signature, signature_len);
@@ -2278,7 +2803,8 @@ rpc_C_SignMessageBegin (CK_X_FUNCTION_LIST *self,
                         CK_ULONG parameter_len)
 {
 	BEGIN_CALL_OR (C_SignMessageBegin, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 	PROCESS_CALL;
 	END_CALL;
@@ -2298,7 +2824,8 @@ rpc_C_SignMessageNext (CK_X_FUNCTION_LIST *self,
         CK_BBOOL signature_expected = signature_len ? 1 : 0;
 
 	BEGIN_CALL_OR (C_SignMessageNext, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (data, data_len)
 		IN_BYTE (signature_expected)
@@ -2315,7 +2842,8 @@ rpc_C_MessageSignFinal (CK_X_FUNCTION_LIST *self,
                         CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_MessageSignFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2327,9 +2855,11 @@ rpc_C_MessageVerifyInit (CK_X_FUNCTION_LIST *self,
                          CK_OBJECT_HANDLE key)
 {
 	BEGIN_CALL_OR (C_MessageVerifyInit, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_MECHANISM (mechanism)
-		IN_ULONG (key)
+		_ret = rpc_input_object_handle (_mod, &_msg, session, key);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2345,7 +2875,8 @@ rpc_C_VerifyMessage (CK_X_FUNCTION_LIST *self,
                      CK_ULONG signature_len)
 {
 	BEGIN_CALL_OR (C_VerifyMessage, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (data, data_len)
 		IN_BYTE_ARRAY (signature, signature_len)
@@ -2360,7 +2891,8 @@ rpc_C_VerifyMessageBegin (CK_X_FUNCTION_LIST *self,
                           CK_ULONG parameter_len)
 {
 	BEGIN_CALL_OR (C_VerifyMessageBegin, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 	PROCESS_CALL;
 	END_CALL;
@@ -2377,7 +2909,8 @@ rpc_C_VerifyMessageNext (CK_X_FUNCTION_LIST *self,
                          CK_ULONG signature_len)
 {
 	BEGIN_CALL_OR (C_VerifyMessageNext, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 		IN_BYTE_ARRAY (parameter, parameter_len)
 		IN_BYTE_ARRAY (data, data_len)
 		IN_BYTE_ARRAY (signature, signature_len)
@@ -2390,7 +2923,8 @@ rpc_C_MessageVerifyFinal (CK_X_FUNCTION_LIST *self,
                           CK_SESSION_HANDLE session)
 {
 	BEGIN_CALL_OR (C_MessageVerifyFinal, self, CKR_SESSION_HANDLE_INVALID);
-		IN_ULONG (session)
+		_ret = rpc_input_session_handle (_mod, &_msg, session);
+		if (_ret != CKR_OK) goto _cleanup;
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2491,6 +3025,7 @@ static void
 rpc_client_free (void *data)
 {
 	rpc_client *client = data;
+	p11_array_free (client->sessions);
 	p11_mutex_uninit (&client->mutex);
 	free (client);
 }
@@ -2515,6 +3050,12 @@ p11_rpc_client_init (p11_virtual *virt,
 
 	p11_mutex_init (&client->mutex);
 	client->vtable = vtable;
+	client->sessions = p11_array_new (rpc_session_map_free);
+	if (client->sessions == NULL) {
+		p11_mutex_uninit (&client->mutex);
+		free (client);
+		return false;
+	}
 
 	p11_virtual_init (virt, &rpc_functions, client, rpc_client_free);
 	return true;
